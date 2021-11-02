@@ -1,0 +1,11 @@
+*.sdf
+src/*.o
+src/*.so
+src/bbhutil/*.o
+src/bbhutil/*.i
+src/bbhutil/*.tab.c 
+src/bbhutil/lex.*.c 
+src/bbhutil/*.tab.h 
+src/bbhutil/librnpl_f.c 
+src/bbhutil/bbhutil_f.c 
+src/bbhutil/sdf_f.c

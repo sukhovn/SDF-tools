@@ -1,0 +1,679 @@
+#!/usr/bin/perl
+########################################################################
+#  !!! IMPORTANT !!!  2007-02-09 Due to apparent deficiencies in mfil
+#  mechanism and/or tarring via E etc. scripts, ensure that this script
+#  is 'pushed' to all appropriate directories (~matt/autoconf/..., CVS etc.)
+#  whenever it is modified
+#
+#  This is now mfi, mfi0 uses BBH_types
+#
+#  History: 'mfi'
+#
+#  This version outputs using conventional C types rather than
+#  BBH_I, BBH_D etc. (for simplicity)
+#
+#  Reads header (.h) file, containing BBHUtil mixed-mode compliant 
+#  headers and produces .c file containing Fortran callable 
+#  interfaces.
+#
+#  Matthew W. Choptuik
+#  Center for Relativity 
+#  The University of Texas at Austin
+#
+#  Copyright 1996
+#
+#  Modifications:
+#     July 1996: Parser now swallows 'extern's
+#                Include 'bbh_types.h' in-line in output file for 
+#                increased portability
+#
+#     Nov  1997: Added system type LINUX. If fcnname contains one or more 
+#                underscores, LINUX/(g77?)  requires an extra underscore
+#                Currently we're assuming you're using g77 on LINUX
+#                                                                   
+#     Aug  1999: Added LINUX_PG  (linux with Portland Group compilers)
+#                which is a synonym for SUN
+#
+#                Added line to convert '* *' -> '**'
+#
+#     Jan  2000: Make LINUX_PG synonym for LINUX
+#    
+#     Nov  2001: Generate both single and double-underscore versions 
+#                of routines for LINUX
+#
+#     Aug  2003: Make LINUX_PG synonym for SUN
+#                                                  
+#     July 2007: Make LINUX_PATH synonym for SUN
+#
+#     Mar  2012: Make LINUX_INTEL64 synonym for SUN
+########################################################################
+$Pgname = `basename $0`; chop $Pgname;
+$Rval = "_mfi_rval";
+
+########################################################################
+#  Currently, separate conversions are performed for "Sun-like" 
+#  systems and Crays
+########################################################################
+@systems = ("SunOS","IRIX","IRIX64","IRIX32","IRIXN32","OSF1",
+            "UNICOS","AIX","A/UX","LINUX","LINUX_PG","LINUX_PATH","DARWIN");
+
+$NSystem = 3;
+ ($SUN,$UNICOS,$LINUX) = 1 .. $NSystem;
+%System = (
+            "SUNOS",  "SUN",    "SUN",     "SUN",
+            "IRIX",   "SUN",    "IRIX64",  "SUN",    
+            "IRIX32", "SUN",    "IRIXN32", "SUN",   
+            "SGI",    "SUN",
+            "OSF1",   "SUN",    "DECOSF",  "SUN",    "DEC",    "SUN",
+            "AIX",    "SUN",    "IBM",     "SUN",
+            "A/UX",   "SUN",    "MAC",     "SUN",    "MACINTOSH", "SUN",
+            "HP-UX",  "SUN",    
+            "UNICOS", "UNICOS", "CRAY",    "UNICOS",
+            "SN4007", "UNICOS",
+            "LINUX",  "LINUX",    
+            "LINUX_PG","SUN",    
+            "DARWIN","LINUX",    
+            "LINUX_IA32","SUN",    
+            "LINUX_IA64","SUN",    
+            "LINUX_INTEL64","SUN",    
+            "LINUX_PATH","SUN",    
+            "UNKNOWN","SUN",    
+          );
+
+sub Usage {
+   printf "Usage: $Pgname <input header file> <output C file>|- [<system> <unique>]\n\n";
+   printf "Use '-' for output to standard output                        \n\n";
+   printf "<unique> is an optional alphanumeric string used to make unique\n";
+   printf "(relative to other '$Pgname' generated source files) routine names.\n\n";
+   printf "Available systems:\n\n";
+   foreach (@systems) {
+      printf; printf "\n";
+   }
+   printf "\nCurrent system: $Host_System\n";
+   exit;
+}
+
+$Ltrace = 0;
+$Verbose = 1;
+
+sub ltrace {
+   local($mess,$rest) = @_;
+   print STDERR "$mess\n" if $Ltrace;
+}
+
+# Define associative arrays for headers & type checking 
+
+%rettype = (
+   "void",     "void",      "BBH_V",   "void",
+   "int",      "int",      "BBH_I",   "int",
+   "double",   "double",      "BBH_D",   "double",
+   "float",    "float",      "BBH_F",   "float",
+           );
+
+%argtype = (
+   "int",      "int",     "BBH_I",     "int",
+   "int *",    "int *",   "BBH_I *",   "int *",
+   "IVEC",     "int *",   
+   "Pint",     "int *",   
+   "float",    "float",     "BBH_F",     "float",
+   "float *",  "float *",   "BBH_F *",   "float *",
+   "SVEC",     "float *",   
+   "double",   "double",     "BBH_D",     "double",
+   "double *", "double *",   "BBH_D *",   "double *",
+   "DVEC",     "double *",   
+   "Pdouble",  "double *",   
+   "char *",   "char *",   "BBH_C *",   "char *",
+   "char **",  "char **",  "BBH_C **",  "char **", "char * *", "char **"
+            );
+
+%argaction = (
+   "int",   "PTR",      "int *",  "NONE",
+   "double",   "PTR",      "double *",  "NONE",
+   "float",   "PTR",      "float  *",  "NONE",
+   "char *", "STRING",   "char **", "VSTRING"
+);
+
+%arginc = ( "SUN.STRING",   1,   "SUN.VSTRING", 1 , 
+            "LINUX.STRING", 1, "LINUX.VSTRING", 1);
+
+%strtype = ( "SUN", "char *",  "UNICOS", "_fcd", "LINUX", "char *" );
+
+&parseargs;
+&ltrace("Will create $System style interface");
+&main;
+
+sub parseargs {
+   &get_Host_System;
+   ($Input_file,$Output_file,$System,$Unique) = @ARGV;
+   $Cvt = defined($Unique) ? "cvt_$Unique" : "cvt";
+   &Usage unless defined($Output_file);
+   $System = $Host_System unless defined($System);
+   $Stdout = $Output_file eq '-';
+   $System =~ tr/[a-z]/[A-Z]/;
+   die "Input file (text) '$Input_file' does not exist\n" 
+       unless (-T $Input_file || $Stdout );
+   die "System '$System' not implemented\n" 
+       unless defined $System{$System};
+   $System = $System{$System};
+}
+
+sub get_Host_System {
+   $Uname = `uname -a`; chop $Uname;
+   &ltrace("<$Uname>\n");
+   foreach( split(' ',$Uname) ) {
+      if( defined($System{$_}) ) {
+         $Host_System = $System{$_};
+         return;
+      }
+   }
+   $Host_System = "UNKNOWN";
+}
+
+sub main {
+
+   die "Could not open $Input_file for read" unless open(INPUT,$Input_file);
+   $save_input = "";
+   while( <INPUT> ) {
+# Ignore pre-processor directives or typedef statements 
+      if( ! (/^#/ || /\s*typedef\s*/) ) {
+         $save_input .= $_;
+      }
+   }
+   @in_headers = split(/;/,$save_input);  pop(@in_headers);
+   $nin_headers = @in_headers;
+   &ltrace("$nin_headers headers");
+   $allvalid = 1;
+   for( $i=0; $i < $nin_headers; $i++ ) {
+      $in_headers[$i] =~ s?\/\*?\777?g;
+      $in_headers[$i] =~ s?\*\/?\777?g;
+      $in_headers[$i] =~ s?^\s+??g;
+      $in_headers[$i] =~ s?\n??g;
+      $in_headers[$i] =~ s?\777[^\777]*\777??g;
+      $in_headers[$i] =~ s?\s+? ?g;
+      $in_headers[$i] =~ s?\s*([\)\(,])\s*?\1?g;
+      $in_headers[$i] =~ s?\s*extern\s??g;
+      &ltrace("Header: $i\n$in_headers[$i]");
+      if( $in_headers[$i] =~ /^(\w+) (\w+)\((.*)\)/ ) {
+         $in_fcntype[$i] = $1;
+         if( !defined($rettype{$in_fcntype[$i]}) ) {
+            printf "Invalid return type '$in_fcntype[$i]' ".
+                   "in header '$in_headers[$i]'\n";
+            $allvalid = 0;
+         }
+         $in_fcntype[$i] = $rettype{$in_fcntype[$i]};
+         $in_fcnname[$i] = $2;
+         $in_fcnargs[$i] = $3;
+          &args_parse($in_fcnargs[$i]);
+      } else {
+         printf "Invalid header '$in_headers[$i]'\n";
+         $allvalid = 0;
+      }
+   }
+   die "Interface generation aborted due to header errors\n" unless $allvalid;
+   if( $Verbose & ! $Stdout ) {
+      printf "Generating $System-style FORTRAN interfaces for the ";
+      printf "following routines:\n";
+      for( $i=0; $i < $nin_headers; $i++ ) {
+         printf "   $in_fcnname[$i]\n";
+      }
+   }
+
+   die "Could not open $Output_file for write" 
+       unless open(OUTPUT,">$Output_file");
+#
+#  Wrap a loop around following to generate single file with '#ifdefs'
+#
+
+
+#  preamble_out generates '#includes' and the necessary conversion routines
+
+   &preamble_out;
+
+#  For each input header
+
+   for( $i=0; $i < $nin_headers; $i++ ) {
+      $out_fcnname = &cvt_fcname($in_fcnname[$i]);
+      $out_fcntype = $in_fcntype[$i];
+      $in_fcnname  = $in_fcnname[$i];
+   
+		if( $in_fcnname =~ /_/ && $System eq "LINUX" ) { 
+          $System = "SUN";
+			 $out_fcnname_alt = &cvt_fcname($in_fcnname[$i]);
+          $System = "LINUX";
+          $genalt = 1;
+		} else {
+			 $genalt = 0;
+		}
+
+#     Reparse input arguments  and generate output argument list
+#     Note: VSTRING args must always be followed by BBH_I (int) assumed to 
+
+      &args_parse($in_fcnargs[$i]);
+      $nout_args = 0;
+      for( $j=0; $j < $nin_args; $j++ ) {
+         $action = $argaction{$argtype{$in_argtype[$j]}};
+         $nout_args ++;
+         $nout_args ++ if defined $arginc{"$System.$action"};
+         if( ($action eq "VSTRING") && ( ($j == $nin_args - 1) ||
+              $argtype{$in_argtype[$j+1]} ne "int") ) {
+            printf "Arg $j of type `char ** in header ";
+            printf "`$in_fcnname[$i] ` must be followed by type int\n";
+            printf "$argtype{$in_argtype[$j+1]}\n";
+            exit;
+         }
+      }
+
+#     Convert args and figure out how many locals are needed
+
+      &ltrace("$nout_args output arguments");
+      $nextra  = 0;
+      $nlocal = 0;
+      for( $j=0; $j < $nin_args; $j++ ) {
+         &cvt_arg($j);
+      }
+      &dump_out if $Ltrace;
+
+#     Generate code for converted function 
+
+      &header_out;
+      &arglist_out;
+      &decl_out;
+      &list_out(*local_init,$nlocal);
+      &call_out;
+      &list_out(*local_copy,$nlocal);
+      &list_out(*local_free,$nlocal);
+      &trailer_out;
+
+      if( $genalt ) {
+			$out_fcnname = $out_fcnname_alt;
+			&header_out;
+			&arglist_out;
+			&decl_out;
+			&list_out(*local_init,$nlocal);
+			&call_out;
+			&list_out(*local_copy,$nlocal);
+			&list_out(*local_free,$nlocal);
+			&trailer_out;
+		}
+   }
+
+   printf "Output in $Output_file\n" if !$Stdout;
+}
+
+#
+#  Communicates via @in_args, $nin_args (globals) ...
+#
+sub args_parse {
+   local($arglist,@rest) = @_;
+   local($i,$type); 
+   @in_args = split(/,/,$arglist);
+   $nin_args = @in_args;
+   for( $i = 0; $i < $nin_args; $i++ ) {
+      $in_args[$i] =~ s?\*\s+\*?**?;
+      if(       $in_args[$i] =~ /^\s*void\s*$/ ) {
+         $nin_args = 0;
+         return;
+      } elsif ( $in_args[$i] =~ /^\s*const\s*(\w+[ ]*[\*]*)[ ]*(\w+)/ ) {
+         $in_argname[$i] = $2;
+         $in_argtype[$i] = $1;
+         $in_argtype[$i] =~ s?\s+$??g;
+         $in_const[$i] = 1;
+         if( !defined($argtype{$in_argtype[$i]}) ) {
+            printf "Invalid argument type '$in_argtype[$i]'\n";
+            printf("<$in_args[$i]>\n");
+         } else {
+            $type = $in_argtype[$i];
+         }
+      } elsif ( $in_args[$i] =~ /^(\w+[ ]*[\*]*)[ ]*(\w+)/ ) {
+         $in_argname[$i] = $2;
+         $in_argtype[$i] = $1;
+         $in_argtype[$i] =~ s?\s+$??g;
+         $in_const[$i] = 0;
+         if( !defined($argtype{$in_argtype[$i]}) ) {
+            printf "Invalid argument type '$in_argtype[$i]'\n";
+            printf("<$in_args[$i]>\n");
+         } else {
+            $type = $in_argtype[$i];
+         }
+      } else {
+         printf "Invalid argument list '$arglist'\n";
+         $allvalid = 0;
+      }
+   }
+}
+
+sub cvt_fcname {
+   local($in,@rest) = @_;
+   if(      $System eq "SUN"    ) {
+      $in."_";
+   } elsif( $System eq "LINUX"  ) {
+		$in =~ /.*_.*/ ? $in."__" : $in."_";
+   } elsif( $System eq "UNICOS" ) {
+      $in =~ tr/[a-z]/[A-Z]/;
+      $in;
+   } else {
+      $in;
+   }
+}
+
+
+#
+#  Communication via $Cvt_type, $Cvt_name, $Cvt_lname;
+#
+sub cvt_arg {
+   local($i,@rest) = @_;
+   local($action,$name,$nname,$type);
+
+   $name = $in_argname[$i];
+   $nname = "*p_".$in_argname[$i+1];
+   $type = $in_argtype[$i];
+   $action = $argaction{$argtype{$type}};
+
+   $out_action[$i] = "$action";
+   if(      $action eq "PTR" ) {
+      $out_argname[$i]    =  "p_$name";
+      $out_argactual[$i]  =  "*p_$name";
+      $out_argtype[$i]  =  "$type *";
+   } elsif( $action eq "STRING" || $action eq "VSTRING" ) {
+      $out_argname[$i]      =  $name;
+      $local_name[$nlocal] =  "l_$name";
+      $out_argactual[$i]  =   "l_$name";
+      $local_type[$nlocal]  =  $in_argtype[$i];
+      if(  $System eq "SUN" || $System eq "LINUX" ) {
+         $out_argtype[$i]  =  "char *";
+         $out_argtype[$nin_args + $nextra] = "int";
+         $out_argname[$nin_args + $nextra] = "len_$name";
+         $out_lname  [$nin_args + $nextra] = "len_$name";
+         $nextra++;
+         if(  $action eq "STRING" ) {
+            $local_init[$nlocal] = 
+               "$local_name[$nlocal] = _STRING_$Cvt($name,len_$name);";
+            if( !$in_const[$i] ) {
+               $local_copy[$nlocal] = 
+                  "_STRCPY_$Cvt($name,$local_name[$nlocal],len_$name);";
+            } else {
+               $local_copy[$nlocal] = "/* $name is 'const' ... */";
+            }
+            $local_free[$nlocal] = "free($local_name[$nlocal]);";
+         } else {
+            $local_init[$nlocal] = 
+               "$local_name[$nlocal] = _VSTRING_$Cvt($name,len_$name,$nname);";
+            if( !$in_const[$i] ) {
+               $local_copy[$nlocal] = 
+                  "_VSTRCPY_$Cvt($name,$local_name[$nlocal],len_$name,$nname);";
+            } else {
+               $local_copy[$nlocal] = "/* $name is 'const' ... */";
+            }
+            $local_free[$nlocal] = 
+               "_free_VSTRING_$Cvt($local_name[$nlocal],$nname);";
+         }
+      } elsif( $System eq "UNICOS" ) {
+         $out_argtype[$i] =  "_fcd";
+         if(  $action eq "STRING" ) {
+            $local_init[$nlocal] = 
+               "$local_name[$nlocal] = _STRING_$Cvt($name);";
+            if( !$in_const[$i] ) {
+               $local_copy[$nlocal] = 
+                  "_STRCPY_$Cvt($name,$local_name[$nlocal]);";
+            } else {
+                $local_copy[$nlocal] = "/* $name is 'const' ... */";
+            }
+            $local_free[$nlocal] = "free($local_name[$nlocal]);";
+         } else {
+            $local_init[$nlocal] = 
+               "$local_name[$nlocal] = _VSTRING_$Cvt($name,$nname);";
+            if( !$in_const[$i] ) {
+               $local_copy[$nlocal] = 
+                  "_VSTRCPY_$Cvt($name,$local_name[$nlocal],$nname);";
+            } else {
+               $local_copy[$nlocal] = "/* $name is 'const' ... */";
+            }
+            $local_free[$nlocal] = 
+               "_free_VSTRING_$Cvt($local_name[$nlocal],$nname);";
+         }
+      }
+      $nlocal++;
+   } else {
+      $out_argname[$i]  = $name;
+      $out_argactual[$i]= $name;
+      $out_lname  [$i]  = $name;
+      $out_argtype[$i]  = $type;
+   }
+}
+
+########################################################################
+#  Debugging output
+########################################################################
+sub dump_out {
+   local($i);
+   for( $i=0; $i < $nout_args; $i++ ) {
+      printf "$out_argtype[$i] $out_argname[$i],\n";
+   }
+}
+
+########################################################################
+#  Generate function header
+########################################################################
+sub header_out {
+   printf OUTPUT "$out_fcntype $out_fcnname(";
+}
+
+########################################################################
+#  Generate function argument list 
+########################################################################
+sub arglist_out {
+   local($i,$header);
+   if( $nout_args ) {
+      printf OUTPUT "\n";
+      for( $i = 0; $i < $nout_args; $i++ ) {
+         printf OUTPUT "   $out_argtype[$i] $out_argname[$i]";
+         printf OUTPUT ",\n" if $i != $nout_args - 1;
+      }
+   } else {
+      printf OUTPUT " void ";
+   }
+   printf OUTPUT " ) {\n\n";
+}
+
+########################################################################
+#  Generate declarations for function
+########################################################################
+sub decl_out {
+   local($i);
+   &decl_out1($out_fcntype,$Rval) if( $out_fcntype ne "void" );
+   for( $i=0; $i < $nlocal; $i++ ) {
+      &decl_out1($local_type[$i],$local_name[$i]);
+   }
+}
+
+########################################################################
+#  Generate an individual declaration
+########################################################################
+sub decl_out1 {
+   local($type,$name,@rest) = @_;
+   print OUTPUT "   $type $name;\n";
+}
+
+########################################################################
+#  Generate a generic indented list 
+########################################################################
+sub list_out {
+   local(*list,$n,*rest) = @_;
+   local($i);
+   if( $n ) {
+      printf OUTPUT "\n";
+      for( $i = 0; $i < $n; $i++ ) {
+         printf OUTPUT "   $list[$i]\n";
+      }
+      printf OUTPUT "\n";
+   }
+}
+
+########################################################################
+#  Generate call statement
+########################################################################
+sub call_out {
+   local($out,$i);
+   if( $out_fcntype ne "void" ) {
+      printf OUTPUT "   $Rval = $in_fcnname(\n";
+   } else {
+      printf OUTPUT "   $in_fcnname(\n";
+   }
+   for( $i=0; $i < $nin_args; $i++ ) {
+      printf OUTPUT "      $out_argactual[$i]";
+      printf OUTPUT ",\n" if $i != $nin_args - 1;
+   }
+   printf OUTPUT "      );\n";
+}
+
+########################################################################
+#  Generate trailer for individual function
+########################################################################
+sub trailer_out {
+   if( $out_fcntype ne "void" ) {
+      printf OUTPUT "   return $Rval;\n";
+   }
+   printf OUTPUT "}\n\n";
+}
+
+########################################################################
+#  Generate '#include's and conversion routines
+########################################################################
+sub preamble_out {
+   if(      $System eq "SUN" || $System eq "LINUX" ) {
+print OUTPUT<<EOF;
+#include <stdio.h>    
+#include <string.h>    
+#include <stdlib.h>    
+#include "$Input_file"
+
+char *_STRING_$Cvt(char *in,int n) {
+   char *out = NULL;
+   int   i;
+   if( in ) {
+		out = (char *) malloc((n + 1) * sizeof(char));
+		strncpy(out,in,n);
+		out[n] = '\\0';
+
+		for(i = n - 1;i >= 0 && out[i] == ' ';i--);
+		if(i >= 0 && i < n) out[i+1] = '\\0';
+   }
+
+   return out;
+}
+
+char **_VSTRING_$Cvt(char *in,int elemlen,int ns) {
+   char **out;
+   int  i,  j;
+   out = (char **) malloc(ns * sizeof(char *));
+   for( i = 0; i < ns; i++ ) {
+      out[i] = (char *)  malloc((elemlen + 1) * sizeof(char));
+      strncpy(out[i],in + i * elemlen,elemlen);
+      out[i][elemlen] = '\\0';
+      for(j = elemlen - 1; j >= 0 && out[i][j] == ' '; j--);
+      if( j >= 0 && j < elemlen ) out[i][j+1] = '\\0';
+   }
+   return out;
+}
+
+void _STRCPY_$Cvt(char *out,char *in,int n) {
+	if( !in ) return;
+   strncpy(out,in,strlen(in));
+}
+
+void _VSTRCPY_$Cvt(char *out,char **in,int elemlen,int ns) {
+   int  i;
+   for( i = 0; i < ns; i++ ) {
+      strncpy(out + i * elemlen,in[i],strlen(in[i]));
+   }
+}
+
+void _free_VSTRING_$Cvt(char **s,int ns) {
+   int    i;
+   for( i = 0; i < ns; i++ ) {
+      if( s[i] ) free(s[i]);
+   }
+   if( s ) free(s);
+}
+
+EOF
+   } elsif( $System eq "UNICOS" ) {
+print OUTPUT<<EOF;
+#include <stdio.h>    
+#include <string.h>    
+#include <fortran.h>    
+#include "$Input_file"
+
+char *_STRING_$Cvt(_fcd in) {
+   char *out;
+   int   i;
+   int   n;
+
+   n = _fcdlen(in);
+   out  = (char *) malloc(n + 1);
+   strncpy(out,_fcdtocp(in),n);
+   out[n] = '\\0';
+
+   for(i = n - 1;i >= 0 && out[i] == ' ';i--);
+   if(i >= 0 && i < n) out[i+1] = '\\0';
+
+   return out;
+}
+
+char **_VSTRING_$Cvt(_fcd in,int ns) {
+   char **out;
+   char *cin;
+   int   elemlen;
+   int   i,  j;
+
+   elemlen = _fcdlen(in);
+
+   out = (char **) malloc(ns * sizeof(char *));
+   cin = _fcdtocp(in);
+
+   for( i = 0; i < ns; i++ ) {
+      out[i] = (char *)  malloc((elemlen + 1) * sizeof(char));
+      strncpy(out[i],cin + i * elemlen,elemlen); 
+      out[i][elemlen] = '\\0';
+      for(j = elemlen - 1; j >= 0 && out[i][j] == ' '; j--);
+      if( j >= 0 && j < elemlen ) out[i][j+1] = '\\0';
+   }
+
+   return out;
+}
+
+void _STRCPY_$Cvt(_fcd out,char *in) {
+   char  *lout;
+   int    n;
+
+   if( !in ) return;
+   n = _fcdlen(out);
+   lout = _fcdtocp(out);
+   strncpy(lout,in,strlen(in));
+   out = _cptofcd(lout,n);
+}
+
+void _VSTRCPY_$Cvt(_fcd out,char **in,int ns) {
+   char *lout;
+   int   i,  n;
+
+   n = _fcdlen(out);
+   lout = _fcdtocp(out);
+   for( i = 0; i < ns; i++ ) {
+      strncpy(lout + i * n,in[i],strlen(in[i]));
+   }
+   out = _cptofcd(lout,n);
+}
+
+
+void _free_VSTRING_$Cvt(char **s,int ns) {
+   int    i;
+   for( i = 0; i < ns; i++ ) {
+      if( s[i] ) free(s[i]);
+   }
+   if( s ) free(s);
+}
+EOF
+
+   }
+}
